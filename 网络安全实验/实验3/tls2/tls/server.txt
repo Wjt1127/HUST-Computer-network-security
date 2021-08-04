@@ -1,0 +1,283 @@
+/*
+对着vpnserver再改
+目前进程： 基本啥都没动 可以不用记录
+明天加油！
+*/
+
+
+#include <arpa/inet.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <linux/if.h>
+#include <linux/if_tun.h>
+#include <sys/ioctl.h>
+#include <shadow.h>
+#include <crypt.h>
+
+#define BUFF_SIZE 2000
+/* define HOME to be dir for key and cert files... */
+#define HOME	"./cert_server/"
+
+/* Make these what you want for cert & key files */
+#define CERTF	HOME"server.crt"
+#define KEYF	HOME"server.key"
+#define CACERT	HOME"ca.crt"
+
+#define CHK_NULL(x)	if ((x)==NULL) exit (1)
+#define CHK_ERR(err,s)	if ((err)==-1) { perror(s); exit(1); }
+#define CHK_SSL(err)	if ((err)==-1) { ERR_print_errors_fp(stderr); exit(2); }
+
+int setupTCPServer();	// Defined in Listing 19.10
+void processRequest(SSL* ssl, int sock, int tunfd);	// Defined in Listing 19.12
+
+int login(char* user, char* passwd)
+{
+	struct spwd* pw;
+	char* epasswd;
+	pw = (struct spwd*)getspnam(user);
+	if (pw == NULL) {
+		return -1;
+	}
+	printf("Login name: %s\n", pw->sp_namp);
+	printf("Encypted Passwd : %s\n", pw->sp_pwdp);
+	epasswd = crypt(passwd, pw->sp_pwdp);
+	if (strcmp(epasswd, pw->sp_pwdp)) {
+		return -1;
+	}
+	return 1;
+}
+
+int verify_callback(int preverify_ok, X509_STORE_CTX* x509_ctx)
+{
+	char buf[300];
+
+	X509* cert = X509_STORE_CTX_get_current_cert(x509_ctx);
+
+	X509_NAME_oneline(X509_get_subject_name(cert), buf, 300);
+	printf("subject= %s\n", buf);
+
+	if (preverify_ok == 1) {
+		printf("Verification passed.\n");
+	}
+	else {
+		int err = X509_STORE_CTX_get_error(x509_ctx);
+
+		printf("Verification failed: %s.\n", X509_verify_cert_error_string(err));
+	}
+}
+
+int createTunDevice()
+{
+	int tunfd;
+	struct ifreq ifr;
+	int ret;
+
+	memset(&ifr, 0, sizeof(ifr));
+
+	/* Flags : IFF_TUN   - TUN设备
+	*         IFF_TAP   - TAP设备
+	*         IFF_NO_PI - 不需要提供包的信息
+	*/
+	ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+
+	tunfd = open("/dev/net/tun", O_RDWR);
+	if (tunfd == -1) {
+		printf("Open /dev/net/tun failed! (%d: %s)\n", errno, strerror(errno));
+		return -1;
+	}
+	ret = ioctl(tunfd, TUNSETIFF, &ifr);
+	if (ret == -1) {
+		printf("Setup TUN interface by ioctl failed! (%d: %s)\n", errno, strerror(errno));
+		return -1;
+	}
+
+	printf("Setup TUN interface success!\n");
+	return tunfd;
+}
+
+
+void tunSelected(int tunfd, SSL* ssl)
+{
+	int len;
+	char buff[BUFF_SIZE];
+
+	printf("Got a packet from TUN\n");
+
+	bzero(buff, BUFF_SIZE);
+	len = read(tunfd, buff, BUFF_SIZE);
+	//sendto(sockfd, buff, len, 0, (struct sockaddr*)&peerAddr, sizeof(peerAddr));
+
+	//使用ssl的加密发送
+	SSL_write(ssl, buff, len);
+}
+
+void socketSelected(int tunfd, SSL* ssl)
+{
+	int len;
+	char buff[BUFF_SIZE];
+
+	printf("Got a packet from the tunnel\n");
+
+	bzero(buff, BUFF_SIZE);
+	len = SSL_read(ssl, buff, sizeof(buff) - 1);
+	buff[len] = '\0';
+
+	write(tunfd, buff, len);
+
+}
+
+
+int main()
+{
+	SSL_METHOD* meth;
+	SSL_CTX* ctx;
+	SSL* ssl;
+	int err;
+
+	/*create Tun0*/
+	//daemon(1, 1);  这个函数放在 SSL_CTX_use_PrivateKey_file  前会卡死
+	int tunfd;
+	tunfd = createTunDevice();
+
+	// Step 0: OpenSSL library initialization 
+	// This step is no longer needed as of version 1.1.0.
+	SSL_library_init();
+	SSL_load_error_strings();
+	SSLeay_add_ssl_algorithms();
+
+	// Step 1: SSL context initialization
+	meth = SSLv23_server_method();
+	ctx = SSL_CTX_new(meth);
+	SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, verify_callback);
+	//SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+	SSL_CTX_load_verify_locations(ctx, CACERT, NULL);
+
+	// Step 2: Set up the server certificate and private key
+	if (SSL_CTX_use_certificate_file(ctx, CERTF, SSL_FILETYPE_PEM) <= 0) {
+		ERR_print_errors_fp(stderr);
+		exit(3);
+	}
+	if (SSL_CTX_use_PrivateKey_file(ctx, KEYF, SSL_FILETYPE_PEM) <= 0) {
+		ERR_print_errors_fp(stderr);
+		exit(4);
+	}
+
+	/* 检查私钥是否正确 */
+	if (!SSL_CTX_check_private_key(ctx)) {
+		fprintf(stderr, "Private key does not match the certificate public key\n");
+		exit(5);
+	}
+
+	struct sockaddr_in sa_client;
+	size_t client_len = sizeof(struct sockaddr_in);
+	int listen_sock = setupTCPServer();
+
+	fprintf(stderr, "listen_sock = %d\n", listen_sock);
+	daemon(1, 1);
+	while (1) {
+		// Step 3: Create a new SSL structure for a connection
+		ssl = SSL_new(ctx);
+
+		int sock = accept(listen_sock, (struct sockaddr*)&sa_client, &client_len);
+
+		fprintf(stderr, "sock = %d\n", sock);
+		if (sock == -1) {
+			fprintf(stderr, "Accept TCP connect failed! (%d: %s)\n", errno, strerror(errno));
+			continue;
+		}
+
+		if (fork() == 0) {	// The child process
+			SSL_set_fd(ssl, sock);
+			int err = SSL_accept(ssl);
+
+			fprintf(stderr, "SSL_accept return %d\n", err);
+			CHK_SSL(err);
+			printf("SSL connection established!\n");
+
+			char username[100], passwd[100];
+			memset(username, 0, sizeof(username));
+			memset(passwd, 0, sizeof(passwd));
+
+			/*Read the username and password*/
+			int userlen = SSL_read(ssl, username, sizeof(username));
+			int passlen = SSL_read(ssl, passwd, sizeof(passwd));
+			if (login(username, passwd)) {//返回为1 那么说明验证成功
+				char buff[100];
+				strcpy(buff, "Yes");
+				buff[3] = '\0';
+				SSL_write(ssl, buff, 3);
+
+				//验证成功才执行
+				processRequest(ssl, sock, tunfd);
+			}
+			else { //send empty packet to client and close the ssl 
+				char buff[100];
+				buff[0] = 'N';
+				buff[1] = 'o';
+				buff[2] = '\0';
+				SSL_write(ssl, buff, 2);
+				printf("Client authentication failed!\n");
+				int r = SSL_shutdown(ssl);
+				//error handling here if r < 0 
+				if (!r)
+				{
+					SSL_shutdown(ssl); //how should I handle return value and error handling here is it required?? 
+				}
+				SSL_free(ssl);
+				close(sock);
+			}
+
+		}
+		else {	// The parent process
+			continue;
+		}
+	}
+}
+
+int setupTCPServer()  //对4433号端口进行listen
+{
+	struct sockaddr_in sa_server;
+	int listen_sock;
+
+	listen_sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+	CHK_ERR(listen_sock, "socket");
+	memset(&sa_server, '\0', sizeof(sa_server));
+	sa_server.sin_family = AF_INET;
+	sa_server.sin_addr.s_addr = INADDR_ANY;
+	sa_server.sin_port = htons(4433);//服务器开启的4433端口进行连接
+	int err = bind(listen_sock, (struct sockaddr*)&sa_server, sizeof(sa_server));
+
+	CHK_ERR(err, "bind");
+	err = listen(listen_sock, 5);
+	CHK_ERR(err, "listen");
+	return listen_sock;
+}
+
+void processRequest(SSL* ssl, int sock, int tunfd)
+{
+	while (1) {
+		/*int select(int maxfdp1, fd_set * readset, fd_set * writeset, fd_set * exceptset, struct timeval* timeout);*/
+		fd_set readFDSet;  //声明文件描述符集
+
+		FD_ZERO(&readFDSet);   //清空
+		FD_SET(sock, &readFDSet);
+		FD_SET(tunfd, &readFDSet);
+		select(FD_SETSIZE, &readFDSet, NULL, NULL, NULL);  //监视socket和tun的读变化
+
+		//如果检测到tun0获得数据 那么向SSL转发这个数据报文
+		if (FD_ISSET(tunfd, &readFDSet)) {
+			tunSelected(tunfd, ssl);
+
+		}
+		if (FD_ISSET(sock, &readFDSet)) {
+			socketSelected(tunfd, ssl);
+		}
+	}
+}
